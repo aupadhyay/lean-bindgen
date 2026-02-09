@@ -1,1 +1,7 @@
 /.lake
+/generated
+/docs
+__pycache__
+/.venv
+/.pytest_cache
+
