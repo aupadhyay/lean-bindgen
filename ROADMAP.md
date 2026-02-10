@@ -6,7 +6,7 @@
 
 ## Proper IR
 
-Right now `mapper.py` maps directly from parsed clang AST to codegen. We need a real intermediate representation that decouples parsing from code generation.
+We need a more robust intermediate representation that decouples parsing from code generation.
 
 ## Strings, Opaque Pointers & Constants
 

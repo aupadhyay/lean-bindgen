@@ -17,8 +17,10 @@ import sys
 from pathlib import Path
 
 from .parser import parse_header, dump_ast_json
-from .mapper import map_function
-from .codegen import gen_lean, gen_c_glue, write_output
+from .ir import BindgenConfig
+from .ir_builder import IRBuilder
+from .type_mapper import TypeMapper
+from .codegen import CodeGenerator, write_output
 
 
 def _header_to_module_name(header_path: Path) -> str:
@@ -76,56 +78,86 @@ def main(argv: list[str] | None = None) -> int:
     module_name: str = args.module or _header_to_module_name(header)
     prefix: str = _header_to_prefix(header)
 
-    # ── Step 1: Parse ─────────────────────────────────────────────────────
-    print(f"[1/4] Parsing {header.name} ...")
+    # Step 1: PARSE
+    print(f"[1/5] Parsing {header.name} ...")
     clang_args = []
     for inc in args.includes:
         clang_args.extend(["-I", inc])
     ast = parse_header(header, extra_args=clang_args or None)
-    print(f"      Found {len(ast.functions)} function(s)")
+    print(f"\tFound {len(ast.functions)} function(s)")
 
-    # ── Step 2: Dump JSON AST ─────────────────────────────────────────────
+    # Step 2: Dump JSON AST
     json_path = dump_ast_json(ast, out_dir / "ast.json")
-    print(f"[2/4] AST written to {json_path}")
+    print(f"[2/5] AST written to {json_path}")
 
-    # ── Step 3: Map types ─────────────────────────────────────────────────
-    print(f"[3/4] Mapping C types → Lean types ...")
-    mapped = []
+    # Step 3: BUILD IR
+    print(f"[3/5] Building IR ...")
+    config = BindgenConfig(
+        module_name=module_name, module_prefix=prefix, header_name=header.name
+    )
+    ir_builder = IRBuilder(config)
+    ir_ctx = ir_builder.build(ast)
+    print(
+        f"\tBuilt IR with {len(ir_ctx.all_types())} type(s), {len(ir_ctx.all_functions())} function(s)"
+    )
+
+    # Step 4: ANALYZE (type mapping)
+    print(f"[4/5] Analyzing types ...")
+    type_mapper = TypeMapper(ir_ctx)
+
+    # Determine which functions are supported
     skipped = []
-    for func in ast.functions:
-        result = map_function(func, prefix)
-        if result is not None:
-            mapped.append(result)
+    for func in ir_ctx.all_functions():
+        # Check if return type is supported
+        ret_mapping = type_mapper.map_type(func.return_type)
+        if ret_mapping is None:
+            skipped.append(func.c_name)
+            continue
+
+        # Check if all parameters are supported
+        all_params_ok = True
+        for param in func.params:
+            param_mapping = type_mapper.map_type(param.type_id)
+            if param_mapping is None:
+                all_params_ok = False
+                break
+
+        if all_params_ok:
+            ir_ctx.mark_function_supported(func.id)
         else:
-            skipped.append(func.name)
+            skipped.append(func.c_name)
 
     if skipped:
         for name in skipped:
-            print(f"      ⚠ Skipped '{name}' (unsupported types)")
-    print(f"      Mapped {len(mapped)}/{len(ast.functions)} function(s)")
+            print(f"\tWarning: Skipped '{name}' (unsupported types)")
 
-    if not mapped:
+    supported_count = len(ir_ctx.get_supported_functions())
+    total_count = len(ir_ctx.all_functions())
+    print(f"\tMapped {supported_count}/{total_count} function(s)")
+
+    if supported_count == 0:
         print("Nothing to generate. Exiting.")
         return 1
 
-    # ── Step 4: Generate code ─────────────────────────────────────────────
-    print(f"[4/4] Generating code ...")
+    # Step 5: CODEGEN
+    print(f"[5/5] Generating code ...")
+    codegen = CodeGenerator(ir_ctx, type_mapper)
 
-    lean_code = gen_lean(module_name, mapped, header.name)
+    lean_code = codegen.generate_lean()
     lean_path = write_output(lean_code, out_dir / f"{module_name}.lean")
-    print(f"      Lean bindings → {lean_path}")
+    print(f"\tLean bindings → {lean_path}")
 
-    c_code = gen_c_glue(mapped, header.name)
+    c_code = codegen.generate_c_glue()
     c_path = write_output(c_code, out_dir / "ffi.c")
-    print(f"      C glue code   → {c_path}")
+    print(f"\tC glue code → {c_path}")
 
     print()
-    print(f"Done! Generated {len(mapped)} binding(s).")
+    print(f"Done! Generated {supported_count} binding(s).")
     print(f"Next steps:")
-    print(f"  1. Copy {lean_path} into your Lean project")
-    print(f"  2. Copy {c_path} into your c/ directory")
-    print(f"  3. Update lakefile.lean to compile the new C file")
-    print(f"  4. Run `lake build`")
+    print(f" 1. Copy {lean_path} into your Lean project")
+    print(f" 2. Copy {c_path} into your c/ directory")
+    print(f" 3. Update lakefile.lean to compile the new C file")
+    print(f" 4. Run `lake build`")
 
     return 0
 

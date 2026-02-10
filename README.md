@@ -8,11 +8,13 @@ Given a `.h` file, `lean-bindgen` produces:
 2. **A `.c` glue file** with thin wrappers that adapt C types to Lean's FFI ABI
 
 
+We use Python to parse the C header files using `libclang`. Ideally, this would be done in Lean, but it seems efforts to [build a C parser in Lean](https://github.com/opencompl/C-parsing-for-Lean4) have been paused.
+
 ## Status
 
 **This project is a work in progress.** Contributions are welcome. See [ROADMAP.md](ROADMAP.md).
 
-The current implementation handles functions with scalar types (`int`, `float`, `double`, etc.). We're incrementally adding support for strings, opaque pointers, enums, callbacks, and structs.
+The current implementation handles trivial functions with scalar types. We're incrementally adding support for strings, opaque pointers, enums, callbacks, and structs.
 
 ## Setup
 
@@ -40,12 +42,19 @@ UPDATE_EXPECTED=1 uv run pytest
 
 ```
 bindgen/
-  __main__.py   # CLI entry point
-  parser.py     # C header parsing via libclang
-  mapper.py     # C type → Lean type mapping
-  codegen.py    # .lean and .c code generation
+  __main__.py      # CLI entry point
+  parser.py        # C header parsing via libclang
+  type_mapper.py   # C type → Lean type mapping
+  ir.py            # Intermediate representation layer
+  ir_builder.py    # Build IR from parsed AST
+  ir_printer.py    # Debug printing for IR
+  codegen.py       # .lean and .c code generation
+
 tests/
-  headers/      # Test input headers
-  expected/     # Golden files for snapshot tests
-  test_snapshot.py
+  headers/         # Test input headers
+  expected/        # Golden files for snapshot tests
+  test_snapshot.py # Snapshot tests
+  test_build_time.py # Build time tests
+  e2e/             # End-to-end tests with actual Lean project
+
 ```

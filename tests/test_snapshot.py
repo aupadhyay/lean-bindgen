@@ -18,8 +18,10 @@ from pathlib import Path
 import pytest
 
 from bindgen.parser import parse_header
-from bindgen.mapper import map_function
-from bindgen.codegen import gen_lean, gen_c_glue
+from bindgen.ir import BindgenConfig
+from bindgen.ir_builder import IRBuilder
+from bindgen.type_mapper import TypeMapper
+from bindgen.codegen import CodeGenerator
 
 TESTS_DIR = Path(__file__).resolve().parent
 HEADERS_DIR = TESTS_DIR / "headers"
@@ -37,23 +39,49 @@ def _header_to_prefix(header_path: Path) -> str:
 
 
 def _run_bindgen(header: Path) -> dict[str, str]:
-    """Run the full parse -> map -> codegen pipeline, return {filename: content}."""
+    """Run the full parse -> IR -> analyze -> codegen pipeline, return {filename: content}."""
     module_name = _header_to_module_name(header)
     prefix = _header_to_prefix(header)
 
+    # Step 1: Parse
     ast = parse_header(header)
 
-    mapped = []
-    for func in ast.functions:
-        result = map_function(func, prefix)
-        if result is not None:
-            mapped.append(result)
+    # Step 2: Build IR
+    config = BindgenConfig(
+        module_name=module_name,
+        module_prefix=prefix,
+        header_name=header.name
+    )
+    ir_builder = IRBuilder(config)
+    ir_ctx = ir_builder.build(ast)
 
+    # Step 3: Analyze (determine supported functions)
+    type_mapper = TypeMapper(ir_ctx)
+
+    for func in ir_ctx.all_functions():
+        # Check if return type is supported
+        ret_mapping = type_mapper.map_type(func.return_type)
+        if ret_mapping is None:
+            continue
+
+        # Check if all parameters are supported
+        all_params_ok = True
+        for param in func.params:
+            param_mapping = type_mapper.map_type(param.type_id)
+            if param_mapping is None:
+                all_params_ok = False
+                break
+
+        if all_params_ok:
+            ir_ctx.mark_function_supported(func.id)
+
+    # Step 4: Generate code
     outputs: dict[str, str] = {}
 
-    if mapped:
-        outputs[f"{module_name}.lean"] = gen_lean(module_name, mapped, header.name)
-        outputs["ffi.c"] = gen_c_glue(mapped, header.name)
+    if ir_ctx.get_supported_functions():
+        codegen = CodeGenerator(ir_ctx, type_mapper)
+        outputs[f"{module_name}.lean"] = codegen.generate_lean()
+        outputs["ffi.c"] = codegen.generate_c_glue()
 
     return outputs
 
