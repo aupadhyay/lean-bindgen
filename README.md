@@ -8,11 +8,11 @@ Given a `.h` file, `lean-bindgen` produces:
 2. **A `.c` glue file** with thin wrappers that adapt C types to Lean's FFI ABI
 
 
-## Disclaimer
+## Status
 
-**This project is a work in progress. Contributions are welcome.** Still need to define a proper IR, support structs/enums/typedefs/opaque pointers, handle callbacks, etc.
+**This project is a work in progress.** Contributions are welcome. See [ROADMAP.md](ROADMAP.md).
 
-The current implementation only handles simple functions with scalar types (`int`, `float`, `double`, etc.).
+The current implementation handles functions with scalar types (`int`, `float`, `double`, etc.). We're incrementally adding support for strings, opaque pointers, enums, callbacks, and structs.
 
 ## Setup
 
