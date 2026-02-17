@@ -6,14 +6,14 @@ This module generates Lean FFI bindings and C glue code from the IR.
 Key features:
   - Uses IRContext + TypeMapper for type translations
   - Queries IR for type information
-  - Extensible for future type categories (pointers, structs, etc.)
+  - Supports opaque pointer types, strings, and scalar types
 
 """
 
 from pathlib import Path
-from typing import List, Union
+from typing import List, Set, Union
 
-from .ir import IRContext, Function, VoidType
+from .ir import IRContext, Function, VoidType, PointerType, PointerKind
 from .type_mapper import TypeMapper, LeanTypeInfo
 
 
@@ -49,6 +49,16 @@ class CodeGenerator:
         lines.append(f"namespace {self.ctx.config.module_name}")
         lines.append(f"")
 
+        # Emit opaque type declarations
+        opaque_names = self._collect_opaque_lean_names()
+        for name in sorted(opaque_names):
+            lines.append(f"opaque {name}.Pointed : NonemptyType")
+            lines.append(f"def {name} : Type := {name}.Pointed.type")
+            lines.append(f"instance : Nonempty {name} := {name}.Pointed.property")
+            lines.append(f"")
+        if opaque_names:
+            lines.append(f"")
+
         # Emit functions
         for func_id in self.ctx.get_supported_functions():
             func = self.ctx.get_function(func_id)
@@ -61,22 +71,55 @@ class CodeGenerator:
 
         return "\n".join(lines)
 
+    def _collect_opaque_lean_names(self) -> Set[str]:
+        """Collect all opaque type Lean names used by supported functions."""
+        names: Set[str] = set()
+        for func_id in self.ctx.get_supported_functions():
+            func = self.ctx.get_function(func_id)
+            if not func:
+                continue
+            # Check return type
+            ret_type = self.ctx.get_type(func.return_type)
+            if (
+                ret_type
+                and isinstance(ret_type.kind, PointerType)
+                and ret_type.kind.kind == PointerKind.OPAQUE
+            ):
+                mapping = self.mapper.map_type(func.return_type)
+                if mapping:
+                    names.add(mapping.lean_type)
+            # Check params
+            for param in func.params:
+                p_type = self.ctx.get_type(param.type_id)
+                if (
+                    p_type
+                    and isinstance(p_type.kind, PointerType)
+                    and p_type.kind.kind == PointerKind.OPAQUE
+                ):
+                    mapping = self.mapper.map_type(param.type_id)
+                    if mapping:
+                        names.add(mapping.lean_type)
+        return names
+
     def _generate_lean_function(self, func: Function) -> List[str]:
         """Generate Lean declaration for a single function."""
         lines: List[str] = []
 
-        # Map return type
         ret_mapping = self.mapper.map_type(func.return_type)
         if ret_mapping is None:
-            # Shouldn't happen for supported functions, but be safe
             return lines
 
         ret_type = self.ctx.get_type(func.return_type)
         is_void = isinstance(ret_type.kind, VoidType) if ret_type else False
+        needs_io = is_void or self._func_needs_io(func)
 
-        # Determine return type signature
+        # Determine return type signature.
+        # We use IO (not BaseIO) because IO uses EStateM.Result which has a
+        # well-defined C calling convention via lean_io_result_mk_ok.
         if is_void:
-            ret_sig = "BaseIO Unit"
+            ret_sig = "IO Unit"
+        elif needs_io:
+            ret_sig = f"IO {ret_mapping.lean_type}"
         else:
             ret_sig = ret_mapping.lean_type
 
@@ -85,7 +128,6 @@ class CodeGenerator:
         for param in func.params:
             param_mapping = self.mapper.map_type(param.type_id)
             if param_mapping is None:
-                # Shouldn't happen, but be safe
                 return lines
             param_decls.append(f"({param.name} : {param_mapping.lean_type})")
 
@@ -103,21 +145,34 @@ class CodeGenerator:
 
         return lines
 
+    def _func_needs_io(self, func: Function) -> bool:
+        """Check if a function requires BaseIO wrapping.
+
+        Any function that takes or returns opaque pointers or strings needs IO
+        for correct reference counting and evaluation ordering.
+        """
+        # Check return type
+        ret_type = self.ctx.get_type(func.return_type)
+        if ret_type and isinstance(ret_type.kind, PointerType):
+            if ret_type.kind.kind in (PointerKind.OPAQUE, PointerKind.STRING):
+                return True
+        # Check parameters
+        for param in func.params:
+            p_type = self.ctx.get_type(param.type_id)
+            if p_type and isinstance(p_type.kind, PointerType):
+                if p_type.kind.kind in (PointerKind.OPAQUE, PointerKind.STRING):
+                    return True
+        return False
+
+    # ------------------------------------------------------------------
+    # C glue output
+    # ------------------------------------------------------------------
+
     def generate_c_glue(self) -> str:
-        """
-        Generate the contents of a .c glue file.
-
-        Each wrapper function:
-          - Takes Lean-compatible types
-          - Casts to original C types
-          - Calls the real C function
-          - Casts result back
-
-        Returns
-        -------
-        Complete .c file content as a string
-        """
+        """Generate the contents of a .c glue file."""
         lines: List[str] = []
+
+        has_pointers = self._has_pointer_types()
 
         # Header
         lines.append(f"/*")
@@ -128,8 +183,16 @@ class CodeGenerator:
         lines.append(f" */")
         lines.append(f"")
         lines.append(f"#include <stdint.h>")
+        if has_pointers:
+            lines.append(f"#include <lean/lean.h>")
         lines.append(f'#include "{self.ctx.config.header_name}"')
         lines.append(f"")
+
+        # Emit opaque type boilerplate (finalizer, external class, box/unbox)
+        opaque_infos = self._collect_opaque_c_infos()
+        for c_type_name, lean_name in sorted(opaque_infos):
+            lower = lean_name[0].lower() + lean_name[1:]
+            lines.extend(self._generate_opaque_boilerplate(c_type_name, lower))
 
         # Emit wrapper functions
         for func_id in self.ctx.get_supported_functions():
@@ -140,17 +203,103 @@ class CodeGenerator:
 
         return "\n".join(lines)
 
+    def _has_pointer_types(self) -> bool:
+        """Check if any supported function uses pointer types."""
+        for func_id in self.ctx.get_supported_functions():
+            func = self.ctx.get_function(func_id)
+            if not func:
+                continue
+            ret_type = self.ctx.get_type(func.return_type)
+            if ret_type and isinstance(ret_type.kind, PointerType):
+                return True
+            for param in func.params:
+                p_type = self.ctx.get_type(param.type_id)
+                if p_type and isinstance(p_type.kind, PointerType):
+                    return True
+        return False
+
+    def _collect_opaque_c_infos(self) -> Set[tuple]:
+        """Collect (c_struct_name, lean_name) pairs for opaque types."""
+        infos: Set[tuple] = set()
+        for func_id in self.ctx.get_supported_functions():
+            func = self.ctx.get_function(func_id)
+            if not func:
+                continue
+
+            type_ids = [func.return_type] + [p.type_id for p in func.params]
+            for tid in type_ids:
+                typ = self.ctx.get_type(tid)
+                if (
+                    typ
+                    and isinstance(typ.kind, PointerType)
+                    and typ.kind.kind == PointerKind.OPAQUE
+                ):
+                    pointee = self.ctx.get_type(typ.kind.pointee)
+                    if pointee:
+                        mapping = self.mapper.map_type(tid)
+                        if mapping:
+                            infos.add((pointee.c_spelling, mapping.lean_type))
+        return infos
+
+    def _generate_opaque_boilerplate(
+        self, c_type_name: str, lower_name: str
+    ) -> List[str]:
+        """Generate finalizer, external class registration, and box/unbox for an opaque type."""
+        lines: List[str] = []
+        lines.append(f"/* Opaque type support for {c_type_name} */")
+        lines.append(f"static void {lower_name}_finalizer(void *ptr) {{")
+        lines.append(
+            f"    /* TODO: call appropriate cleanup function for {c_type_name} */"
+        )
+        lines.append(f"}}")
+        lines.append(f"")
+        lines.append(f"static lean_external_class *g_{lower_name}_class = NULL;")
+        lines.append(f"")
+        lines.append(f"static lean_external_class *get_{lower_name}_class(void) {{")
+        lines.append(f"    if (g_{lower_name}_class == NULL) {{")
+        lines.append(f"        g_{lower_name}_class = lean_register_external_class(")
+        lines.append(f"            {lower_name}_finalizer, NULL);")
+        lines.append(f"    }}")
+        lines.append(f"    return g_{lower_name}_class;")
+        lines.append(f"}}")
+        lines.append(f"")
+        lines.append(
+            f"static inline lean_object *{lower_name}_box({c_type_name} *p) {{"
+        )
+        lines.append(
+            f"    return lean_alloc_external(get_{lower_name}_class(), (void *)p);"
+        )
+        lines.append(f"}}")
+        lines.append(f"")
+        lines.append(
+            f"static inline {c_type_name} *{lower_name}_unbox(lean_object *o) {{"
+        )
+        lines.append(f"    return ({c_type_name} *)lean_get_external_data(o);")
+        lines.append(f"}}")
+        lines.append(f"")
+        return lines
+
     def _generate_c_function(self, func: Function) -> List[str]:
-        """Generate C wrapper for a single function."""
+        """Generate C wrapper for a single function.
+
+        Follows Lean's ownership convention: all lean_object* arguments are
+        received as owned references. The wrapper must lean_dec each one after
+        extracting the data it needs.
+
+        BaseIO uses ST.Out (single-constructor struct, erased to newtype), so
+        functions returning BaseIO return the raw value — NOT wrapped in
+        lean_io_result_mk_ok. For void BaseIO functions, return lean_box(0).
+        """
         lines: List[str] = []
 
-        # Map return type
         ret_mapping = self.mapper.map_type(func.return_type)
         if ret_mapping is None:
             return lines
 
         ret_type = self.ctx.get_type(func.return_type)
         is_void = isinstance(ret_type.kind, VoidType) if ret_type else False
+        ret_is_pointer = isinstance(ret_type.kind, PointerType) if ret_type else False
+        needs_io_return = is_void or self._func_needs_io(func)
 
         # Build parameter list for wrapper
         ffi_params = []
@@ -160,40 +309,128 @@ class CodeGenerator:
                 return lines
             ffi_params.append(f"{param_mapping.c_ffi_type} {param.name}")
 
+        # BaseIO functions get extra lean_object* parameter for the world token
+        if needs_io_return:
+            ffi_params.append("lean_object* w")
+
         ffi_param_str = ", ".join(ffi_params) if ffi_params else "void"
 
-        # Build argument list for calling original function
+        # Build extern symbol
+        extern_symbol = f"lean_{self.ctx.config.module_prefix}_{func.c_name}"
+
+        # Determine wrapper return type.
+        # IO uses EStateM.Result (two constructors: ok/error), so IO functions
+        # always return lean_object* via lean_io_result_mk_ok.
+        if needs_io_return:
+            wrapper_ret_type = "lean_object*"
+        else:
+            wrapper_ret_type = ret_mapping.c_ffi_type
+
+        # Generate wrapper function body
+        lines.append(f"{wrapper_ret_type} {extern_symbol}({ffi_param_str}) {{")
+
+        # Step 1: Extract raw C values from lean_object* params into locals.
+        # We do this before lean_dec so the objects are alive during extraction.
         call_args = []
+        lean_obj_params = []  # params that need lean_dec
+
         for param in func.params:
-            # Get original C type
             param_type = self.ctx.get_type(param.type_id)
-            if param_type:
+            if param_type and isinstance(param_type.kind, PointerType):
+                kind = param_type.kind
+                if kind.kind == PointerKind.OPAQUE:
+                    pointee = self.ctx.get_type(kind.pointee)
+                    local_var = f"c_{param.name}"
+                    lines.append(
+                        f"    {pointee.c_spelling if pointee else 'void'} *{local_var} = {self._c_unbox_arg(param.name, param_type)};"
+                    )
+                    call_args.append(local_var)
+                    lean_obj_params.append(param.name)
+                elif kind.kind == PointerKind.STRING:
+                    local_var = f"c_{param.name}"
+                    lines.append(
+                        f"    const char *{local_var} = lean_string_cstr({param.name});"
+                    )
+                    call_args.append(local_var)
+                    lean_obj_params.append(param.name)
+                else:
+                    call_args.append(param.name)
+            elif param_type:
                 call_args.append(f"({param_type.c_spelling}){param.name}")
             else:
                 call_args.append(param.name)
 
         call_args_str = ", ".join(call_args)
 
-        # Build extern symbol
-        extern_symbol = f"lean_{self.ctx.config.module_prefix}_{func.c_name}"
-
-        # Generate wrapper function
+        # Step 2: Call the C function
         if is_void:
-            lines.append(f"void {extern_symbol}({ffi_param_str}) {{")
             lines.append(f"    {func.c_name}({call_args_str});")
-            lines.append(f"}}")
-        else:
+        elif ret_is_pointer:
             lines.append(
-                f"{ret_mapping.c_ffi_type} {extern_symbol}({ffi_param_str}) {{"
+                f"    {ret_type.c_spelling if ret_type else 'void'} result = {func.c_name}({call_args_str});"
             )
+        elif needs_io_return:
+            lines.append(
+                f"    {ret_mapping.c_ffi_type} result = ({ret_mapping.c_ffi_type}){func.c_name}({call_args_str});"
+            )
+        else:
+            # Pure scalar — no lean_dec needed, just return directly
             lines.append(
                 f"    return ({ret_mapping.c_ffi_type}){func.c_name}({call_args_str});"
             )
             lines.append(f"}}")
+            lines.append(f"")
+            return lines
 
+        # Step 3: lean_dec all owned lean_object* params
+        for obj_name in lean_obj_params:
+            lines.append(f"    lean_dec({obj_name});")
+        if needs_io_return:
+            lines.append(f"    lean_dec(w);")
+
+        # Step 4: Return result via lean_io_result_mk_ok (IO convention).
+        if is_void:
+            lines.append(f"    return lean_io_result_mk_ok(lean_box(0));")
+        elif ret_is_pointer:
+            boxed = self._c_box_result("result", ret_type)
+            lines.append(f"    return lean_io_result_mk_ok({boxed});")
+        elif needs_io_return:
+            lines.append(f"    return lean_io_result_mk_ok(lean_box((size_t)result));")
+
+        lines.append(f"}}")
         lines.append(f"")
 
         return lines
+
+    def _c_unbox_arg(self, param_name: str, param_type) -> str:
+        """Generate the C expression to unbox a parameter."""
+        kind = param_type.kind
+        if isinstance(kind, PointerType):
+            if kind.kind == PointerKind.OPAQUE:
+                pointee = self.ctx.get_type(kind.pointee)
+                if pointee:
+                    mapping = self.mapper.map_type(param_type.id)
+                    if mapping:
+                        lower = mapping.lean_type[0].lower() + mapping.lean_type[1:]
+                        return f"{lower}_unbox({param_name})"
+            elif kind.kind == PointerKind.STRING:
+                return f"lean_string_cstr({param_name})"
+        return param_name
+
+    def _c_box_result(self, var_name: str, ret_type) -> str:
+        """Generate the C expression to box a return value."""
+        kind = ret_type.kind
+        if isinstance(kind, PointerType):
+            if kind.kind == PointerKind.OPAQUE:
+                pointee = self.ctx.get_type(kind.pointee)
+                if pointee:
+                    mapping = self.mapper.map_type(ret_type.id)
+                    if mapping:
+                        lower = mapping.lean_type[0].lower() + mapping.lean_type[1:]
+                        return f"{lower}_box({var_name})"
+            elif kind.kind == PointerKind.STRING:
+                return f"lean_mk_string({var_name})"
+        return var_name
 
 
 def write_output(

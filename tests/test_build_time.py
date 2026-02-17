@@ -60,12 +60,10 @@ def test_build_time_bindgen(e2e_project):
     )
 
     # Verify generated files were created
-    assert (e2e_project / "generated" / "SimpleMath.lean").exists(), (
-        "bindgen target did not produce generated/SimpleMath.lean"
-    )
-    assert (e2e_project / "generated" / "ffi.c").exists(), (
-        "bindgen target did not produce generated/ffi.c"
-    )
+    assert (e2e_project / "generated" / "simple_math" / "SimpleMath.lean").exists()
+    assert (e2e_project / "generated" / "simple_math" / "ffi.c").exists()
+    assert (e2e_project / "generated" / "handle_lib" / "HandleLib.lean").exists()
+    assert (e2e_project / "generated" / "handle_lib" / "ffi.c").exists()
 
     # Run the built binary
     binary = e2e_project / ".lake" / "build" / "bin" / "test"
@@ -78,5 +76,11 @@ def test_build_time_bindgen(e2e_project):
     )
     assert run.returncode == 0, f"binary crashed:\n{run.stderr}"
     assert "add(5, 3) = 8" in run.stdout, (
+        f"unexpected output:\n{run.stdout}"
+    )
+    assert "handle_name = hello-from-lean" in run.stdout, (
+        f"unexpected output:\n{run.stdout}"
+    )
+    assert "handle_close = 0" in run.stdout, (
         f"unexpected output:\n{run.stdout}"
     )

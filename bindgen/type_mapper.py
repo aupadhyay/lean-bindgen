@@ -20,6 +20,7 @@ from .ir import (
     FloatType,
     VoidType,
     PointerType,
+    PointerKind,
     IntKind,
     FloatKind,
 )
@@ -108,9 +109,9 @@ class TypeMapper:
         if isinstance(kind, VoidType):
             return self._map_void()
 
-        # Pointer types (not yet supported in this phase)
+        # Pointer types
         if isinstance(kind, PointerType):
-            return None  # Will be implemented later
+            return self._map_pointer(kind, typ)
 
         # Unknown type
         return None
@@ -162,3 +163,39 @@ class TypeMapper:
         Void is only valid as a return type and maps to Unit in Lean.
         """
         return LeanTypeInfo(lean_type="Unit", c_ffi_type="void")
+
+    def _map_pointer(self, ptr_type: PointerType, typ: Type) -> Optional[LeanTypeInfo]:
+        """Map pointer types based on their kind."""
+        if ptr_type.kind == PointerKind.OPAQUE:
+            pointee = self.ctx.get_type(ptr_type.pointee)
+            if pointee is None:
+                return None
+            lean_name = self._to_lean_opaque_name(pointee.c_spelling)
+            return LeanTypeInfo(
+                lean_type=lean_name,
+                c_ffi_type="lean_object*",
+                needs_conversion=True,
+                is_opaque=True,
+            )
+
+        if ptr_type.kind == PointerKind.STRING:
+            return LeanTypeInfo(
+                lean_type="String",
+                c_ffi_type="lean_object*",
+                needs_conversion=True,
+            )
+
+        return None
+
+    @staticmethod
+    def _to_lean_opaque_name(c_name: str) -> str:
+        """Convert a C struct name to a Lean opaque type name.
+
+        e.g. "my_handle" -> "MyHandleRef", "sqlite3" -> "Sqlite3Ref"
+        """
+        # Remove "struct " prefix if present
+        name = c_name.removeprefix("struct ")
+        # Split on underscores and capitalize each part
+        parts = name.split("_")
+        pascal = "".join(p.capitalize() for p in parts if p)
+        return f"{pascal}Ref"

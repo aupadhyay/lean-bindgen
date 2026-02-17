@@ -10,7 +10,7 @@ the language-agnostic IR. It:
 
 """
 
-from typing import Optional, Dict
+from typing import Optional, Dict, Set
 
 from .ir import (
     IRContext,
@@ -20,6 +20,8 @@ from .ir import (
     IntType,
     FloatType,
     VoidType,
+    PointerType,
+    PointerKind,
     TypeKind,
     Function,
     Param,
@@ -35,10 +37,11 @@ class IRBuilder:
     Converts parsed AST to IR.
 
     Strategy:
-      1. Process each function declaration
-      2. Convert return types and parameters to IR types
-      3. Cache type conversions to avoid duplicates
-      4. Populate IRContext with all IR nodes
+      1. Process typedefs to discover opaque struct names
+      2. Process each function declaration
+      3. Convert return types and parameters to IR types
+      4. Cache type conversions to avoid duplicates
+      5. Populate IRContext with all IR nodes
     """
 
     def __init__(self, config: BindgenConfig):
@@ -47,6 +50,12 @@ class IRBuilder:
         # Cache: Clang type string -> IR TypeId
         # Key format: "{type_kind}:{c_spelling}"
         self._clang_type_cache: Dict[str, TypeId] = {}
+
+        # Set of struct names that have a typedef (opaque types)
+        self._opaque_names: Set[str] = set()
+
+        # Cache: opaque name -> TypeId for the opaque pointee type
+        self._opaque_type_cache: Dict[str, TypeId] = {}
 
     def build(self, ast: CHeaderAST) -> IRContext:
         """
@@ -60,10 +69,14 @@ class IRBuilder:
         -------
         Populated IRContext ready for analysis
         """
+        # Process typedefs first to register opaque names
+        for td in ast.typedefs:
+            if td.is_struct_typedef:
+                self._opaque_names.add(td.name)
+
         # Convert each function
         for func_decl in ast.functions:
-            func_id = self._convert_function(func_decl)
-            # Note: functions that fail conversion return None and are skipped
+            self._convert_function(func_decl)
 
         return self.ctx
 
@@ -74,17 +87,27 @@ class IRBuilder:
         Returns None if the function uses unsupported types.
         """
         # Convert return type
-        ret_type_id = self._convert_clang_type(func.return_type_kind, func.return_type)
+        ret_type_id = self._convert_clang_type(
+            func.return_type_kind,
+            func.return_type,
+            pointee_spelling=func.ret_pointee_spelling,
+            pointee_kind=func.ret_pointee_kind,
+            is_const_pointee=func.ret_is_const_pointee,
+        )
         if ret_type_id is None:
-            # Unsupported return type - skip this function
             return None
 
         # Convert parameters
         params = []
         for p in func.params:
-            p_type_id = self._convert_clang_type(p.type_kind, p.c_type)
+            p_type_id = self._convert_clang_type(
+                p.type_kind,
+                p.c_type,
+                pointee_spelling=p.pointee_spelling,
+                pointee_kind=p.pointee_kind,
+                is_const_pointee=p.is_const_pointee,
+            )
             if p_type_id is None:
-                # Unsupported parameter type - skip this function
                 return None
             params.append(Param(name=p.name, type_id=p_type_id))
 
@@ -101,20 +124,28 @@ class IRBuilder:
 
         return self.ctx.add_function(ir_func)
 
-    def _convert_clang_type(self, type_kind: str, c_spelling: str) -> Optional[TypeId]:
+    def _convert_clang_type(
+        self,
+        type_kind: str,
+        c_spelling: str,
+        pointee_spelling: Optional[str] = None,
+        pointee_kind: Optional[str] = None,
+        is_const_pointee: bool = False,
+    ) -> Optional[TypeId]:
         """
         Convert a Clang type to an IR type.
 
         Parameters
         ----------
-        type_kind   : Clang canonical TypeKind name (e.g., "INT", "FLOAT")
-        c_spelling  : Original C type spelling (e.g., "int", "uint32_t")
+        type_kind         : Clang canonical TypeKind name (e.g., "INT", "POINTER")
+        c_spelling        : Original C type spelling (e.g., "int", "my_handle *")
+        pointee_spelling  : Spelling of the pointee type (for pointers)
+        pointee_kind      : TypeKind of the pointee (for pointers)
+        is_const_pointee  : Whether the pointee is const-qualified
 
         Returns
         -------
         TypeId for the IR type, or None if unsupported
-
-        Caches conversions to avoid duplicate types in the IR.
         """
         # Check cache first
         cache_key = f"{type_kind}:{c_spelling}"
@@ -139,6 +170,12 @@ class IRBuilder:
         if ir_kind is None and type_kind == "VOID":
             ir_kind = VoidType()
 
+        # Try pointer types
+        if ir_kind is None and type_kind == "POINTER":
+            return self._convert_pointer_type(
+                c_spelling, pointee_spelling, pointee_kind, is_const_pointee, cache_key
+            )
+
         # If we still don't have a type, it's unsupported
         if ir_kind is None:
             return None
@@ -147,11 +184,83 @@ class IRBuilder:
         type_id = self.ctx.add_type(
             kind=ir_kind,
             c_spelling=c_spelling,
-            canonical=None,  # No typedef resolution yet
-            layout=None,  # Layout info not needed for primitives
+            canonical=None,
+            layout=None,
         )
 
         # Cache it
         self._clang_type_cache[cache_key] = type_id
 
+        return type_id
+
+    def _convert_pointer_type(
+        self,
+        c_spelling: str,
+        pointee_spelling: Optional[str],
+        pointee_kind: Optional[str],
+        is_const_pointee: bool,
+        cache_key: str,
+    ) -> Optional[TypeId]:
+        """Convert a pointer type to IR, classifying it by kind."""
+        ptr_kind = self._classify_pointer(
+            pointee_spelling, pointee_kind, is_const_pointee
+        )
+        if ptr_kind is None:
+            return None
+
+        # Get or create the pointee type in IR
+        pointee_type_id = self._get_or_create_opaque_type(pointee_spelling or "void")
+
+        ir_kind = PointerType(
+            pointee=pointee_type_id,
+            kind=ptr_kind,
+            is_const=is_const_pointee,
+        )
+
+        type_id = self.ctx.add_type(
+            kind=ir_kind,
+            c_spelling=c_spelling,
+        )
+
+        self._clang_type_cache[cache_key] = type_id
+        return type_id
+
+    def _classify_pointer(
+        self,
+        pointee_spelling: Optional[str],
+        pointee_kind: Optional[str],
+        is_const_pointee: bool,
+    ) -> Optional[PointerKind]:
+        """
+        Classify a pointer by its kind.
+
+        Returns None for unsupported pointer types (void*, function pointers, etc.)
+        """
+        if pointee_kind is None:
+            return None
+
+        # const char* -> STRING
+        if pointee_kind == "CHAR_S" and is_const_pointee:
+            return PointerKind.STRING
+
+        # Pointer to a known opaque struct -> OPAQUE
+        if pointee_kind == "RECORD" and pointee_spelling:
+            # Extract the struct name (remove "struct " prefix if present)
+            name = pointee_spelling.removeprefix("struct ")
+            if name in self._opaque_names:
+                return PointerKind.OPAQUE
+
+        # Unsupported pointer types (void*, non-const char*, unknown structs, etc.)
+        return None
+
+    def _get_or_create_opaque_type(self, name: str) -> TypeId:
+        """Get or create a placeholder type for an opaque pointee."""
+        if name in self._opaque_type_cache:
+            return self._opaque_type_cache[name]
+
+        type_id = self.ctx.add_type(
+            kind=VoidType(),  # Placeholder — the pointee is opaque
+            c_spelling=name,
+        )
+        self._opaque_type_cache[name] = type_id
         return type_id

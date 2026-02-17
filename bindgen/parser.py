@@ -37,6 +37,9 @@ class CParam:
     name: str
     c_type: str  # e.g. "int", "double", "const char *"
     type_kind: str  # clang TypeKind name, e.g. "INT", "DOUBLE", "POINTER"
+    pointee_spelling: Optional[str] = None  # e.g. "my_handle" for my_handle*
+    pointee_kind: Optional[str] = None  # e.g. "RECORD" for struct pointers
+    is_const_pointee: bool = False
 
 
 @dataclass
@@ -48,6 +51,19 @@ class CFuncDecl:
     return_type_kind: str  # e.g. "INT"
     params: list[CParam] = field(default_factory=list)
     source_file: Optional[str] = None
+    ret_pointee_spelling: Optional[str] = None
+    ret_pointee_kind: Optional[str] = None
+    ret_is_const_pointee: bool = False
+
+
+@dataclass
+class CTypedefDecl:
+    """A typedef declaration extracted from a header."""
+
+    name: str  # e.g. "my_handle"
+    underlying_type: str  # e.g. "struct my_handle"
+    underlying_kind: str  # e.g. "RECORD"
+    is_struct_typedef: bool = False  # True for `typedef struct X X;`
 
 
 @dataclass
@@ -56,6 +72,7 @@ class CHeaderAST:
 
     header_path: str
     functions: list[CFuncDecl] = field(default_factory=list)
+    typedefs: list[CTypedefDecl] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -63,15 +80,44 @@ class CHeaderAST:
 # ---------------------------------------------------------------------------
 
 
-def _resolve_type(clang_type) -> tuple[str, str]:
+@dataclass
+class _ResolvedType:
+    """Internal result from _resolve_type."""
+
+    spelling: str
+    kind_name: str
+    pointee_spelling: Optional[str] = None
+    pointee_kind: Optional[str] = None
+    is_const_pointee: bool = False
+
+
+def _resolve_type(clang_type) -> _ResolvedType:
     """
-    Get a clean (spelling, kind_name) pair from a clang Type.
-    Follows typedefs to their canonical form so we map the *real* type.
+    Get type info from a clang Type.
+    Follows typedefs to canonical form and extracts pointee info for pointers.
     """
     canonical = clang_type.get_canonical()
-    spelling = clang_type.spelling  # keep the user-facing name
-    kind_name = canonical.kind.name  # but use the canonical kind for mapping
-    return spelling, kind_name
+    spelling = clang_type.spelling
+    kind_name = canonical.kind.name
+
+    pointee_spelling = None
+    pointee_kind = None
+    is_const_pointee = False
+
+    if canonical.kind == TypeKind.POINTER:
+        pointee = canonical.get_pointee()
+        pointee_canonical = pointee.get_canonical()
+        pointee_spelling = pointee_canonical.spelling
+        pointee_kind = pointee_canonical.kind.name
+        is_const_pointee = pointee.is_const_qualified()
+
+    return _ResolvedType(
+        spelling=spelling,
+        kind_name=kind_name,
+        pointee_spelling=pointee_spelling,
+        pointee_kind=pointee_kind,
+        is_const_pointee=is_const_pointee,
+    )
 
 
 def parse_header(
@@ -109,27 +155,46 @@ def parse_header(
         if cursor.location.file and cursor.location.file.name != str(header_path):
             continue
 
-        if cursor.kind == CursorKind.FUNCTION_DECL:  # type: ignore[attr-defined]
-            ret_spelling, ret_kind = _resolve_type(cursor.result_type)
+        if cursor.kind == CursorKind.TYPEDEF_DECL:
+            underlying = cursor.underlying_typedef_type
+            canonical = underlying.get_canonical()
+            is_struct = canonical.kind == TypeKind.RECORD
+            ast.typedefs.append(
+                CTypedefDecl(
+                    name=cursor.spelling,
+                    underlying_type=underlying.spelling,
+                    underlying_kind=canonical.kind.name,
+                    is_struct_typedef=is_struct,
+                )
+            )
+
+        elif cursor.kind == CursorKind.FUNCTION_DECL:
+            ret = _resolve_type(cursor.result_type)
 
             params = []
             for i, arg in enumerate(cursor.get_arguments()):
-                p_spelling, p_kind = _resolve_type(arg.type)
+                p = _resolve_type(arg.type)
                 params.append(
                     CParam(
                         name=arg.spelling or f"arg{i}",
-                        c_type=p_spelling,
-                        type_kind=p_kind,
+                        c_type=p.spelling,
+                        type_kind=p.kind_name,
+                        pointee_spelling=p.pointee_spelling,
+                        pointee_kind=p.pointee_kind,
+                        is_const_pointee=p.is_const_pointee,
                     )
                 )
 
             ast.functions.append(
                 CFuncDecl(
                     name=cursor.spelling,
-                    return_type=ret_spelling,
-                    return_type_kind=ret_kind,
+                    return_type=ret.spelling,
+                    return_type_kind=ret.kind_name,
                     params=params,
                     source_file=str(header_path),
+                    ret_pointee_spelling=ret.pointee_spelling,
+                    ret_pointee_kind=ret.pointee_kind,
+                    ret_is_const_pointee=ret.is_const_pointee,
                 )
             )
 
